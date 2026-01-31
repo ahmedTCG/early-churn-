@@ -1,0 +1,10 @@
+{
+  "max_time": "2024-12-22 11:15:23+00:00",
+  "snap_test": "2024-11-22 11:15:23+00:00",
+  "train_rows": 530662,
+  "test_rows": 223672,
+  "train_churn_rate": 0.8225461781699085,
+  "test_churn_rate": 0.7643871383096678,
+  "n_features": 36,
+  "using_partitioned_dataset": true
+}

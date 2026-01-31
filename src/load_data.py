@@ -2,8 +2,8 @@ import pandas as pd
 from pathlib import Path
 
 # ---- config ----
-DATA_PATH = Path(".")  # put your csv/parquet files here
-FILE_NAME = "ubdated.csv"          # set later, e.g. "churn_1.csv"
+DATA_PATH = Path(".")  
+FILE_NAME = "ubdated.csv"         
 
 
 def load_data(file_name: str) -> pd.DataFrame:
