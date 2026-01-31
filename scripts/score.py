@@ -1,23 +1,22 @@
 from pathlib import Path
 import json
+import warnings
 
 import numpy as np
 import pandas as pd
 import joblib
-import pyarrow.dataset as ds
 
 from churn.features import build_customer_features
 
-# -------------------------
-# Config
-# -------------------------
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("ignore", message=".*encountered in matmul.*")
+np.seterr(over="ignore", divide="ignore", invalid="ignore")
+
 ID_COL = "external_customerkey"
 LOOKBACK_DAYS = 90
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
 ACTIVITY_FILE = PROJECT_ROOT / "activity_events.parquet"
-ACTIVITY_DS_DIR = PROJECT_ROOT / "activity_events_ds"
 
 ART_DIR = PROJECT_ROOT / "artifacts"
 MODEL_FILE = ART_DIR / "churn_model.joblib"
@@ -27,28 +26,18 @@ OUT_PARQUET = PROJECT_ROOT / "customer_scores.parquet"
 OUT_CSV = PROJECT_ROOT / "customer_scores.csv"
 
 
-def _months_in_range(start: pd.Timestamp, end: pd.Timestamp) -> list:
-    start_m = pd.Period(start.to_pydatetime(), freq="M")
-    end_m = pd.Period(end.to_pydatetime(), freq="M")
-    return [p.strftime("%Y-%m") for p in pd.period_range(start_m, end_m, freq="M")]
+def get_max_time() -> pd.Timestamp:
+    s = pd.to_datetime(
+        pd.read_parquet(ACTIVITY_FILE, columns=["event_time"])["event_time"],
+        errors="coerce",
+        utc=True,
+    )
+    return s.max()
 
 
 def load_events(window_start: pd.Timestamp, window_end: pd.Timestamp) -> pd.DataFrame:
     cols = [ID_COL, "event_time", "interaction_type"]
-
-    if ACTIVITY_DS_DIR.exists():
-        months = _months_in_range(window_start, window_end)
-        dataset = ds.dataset(
-            str(ACTIVITY_DS_DIR),
-            format="parquet",
-            partitioning=ds.partitioning(field_names=["event_month"]),
-        )
-        table = dataset.to_table(columns=cols, filter=ds.field("event_month").isin(months))
-        df = table.to_pandas()
-    else:
-        if not ACTIVITY_FILE.exists():
-            raise FileNotFoundError("Missing activity data. Run steps 1→3.")
-        df = pd.read_parquet(ACTIVITY_FILE, columns=cols)
+    df = pd.read_parquet(ACTIVITY_FILE, columns=cols)
 
     df["event_time"] = pd.to_datetime(df["event_time"], errors="coerce", utc=True)
     df = df.dropna(subset=[ID_COL, "event_time", "interaction_type"]).copy()
@@ -57,18 +46,6 @@ def load_events(window_start: pd.Timestamp, window_end: pd.Timestamp) -> pd.Data
     df[ID_COL] = df[ID_COL].astype("string").str.strip().astype("category")
     df["interaction_type"] = df["interaction_type"].astype("string").str.strip().str.lower().astype("category")
     return df
-
-
-def get_max_time() -> pd.Timestamp:
-    if ACTIVITY_FILE.exists():
-        s = pd.to_datetime(pd.read_parquet(ACTIVITY_FILE, columns=["event_time"])["event_time"], errors="coerce", utc=True)
-        return s.max()
-    if ACTIVITY_DS_DIR.exists():
-        dataset = ds.dataset(str(ACTIVITY_DS_DIR), format="parquet")
-        table = dataset.to_table(columns=["event_time"])
-        s = pd.to_datetime(table.column("event_time").to_pandas(), errors="coerce", utc=True)
-        return s.max()
-    raise FileNotFoundError("No activity data found. Run steps 1→3.")
 
 
 def make_X(feats: pd.DataFrame, feature_list: list) -> pd.DataFrame:
@@ -85,10 +62,14 @@ def make_X(feats: pd.DataFrame, feature_list: list) -> pd.DataFrame:
     for c in feature_list:
         if c not in X.columns:
             X[c] = 0
+
     return X[feature_list]
 
 
 def main():
+    if not ACTIVITY_FILE.exists():
+        raise FileNotFoundError("Missing activity_events.parquet. Run: python scripts/activity.py")
+
     if not MODEL_FILE.exists() or not FEATURES_FILE.exists():
         raise FileNotFoundError("Missing model artifacts. Run: python scripts/train.py")
 
@@ -97,9 +78,8 @@ def main():
 
     snapshot_time = get_max_time()
     window_start = snapshot_time - pd.Timedelta(days=LOOKBACK_DAYS)
-    window_end = snapshot_time
 
-    events = load_events(window_start, window_end)
+    events = load_events(window_start, snapshot_time)
 
     feats = build_customer_features(events, snapshot_time=snapshot_time)
     X = make_X(feats, feature_list)

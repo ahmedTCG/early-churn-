@@ -1,7 +1,7 @@
 from pathlib import Path
 import pandas as pd
 
-RAW_FILE = Path("customer_interactions_fact_202601301656.csv")
+RAW_FILE = Path("ubdated.csv")
 OUT_FILE = Path("cleaned_events.parquet")
 
 # Keep only what the whole project needs
