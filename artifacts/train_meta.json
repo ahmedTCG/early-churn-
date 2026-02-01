@@ -1,10 +1,18 @@
 {
   "max_time": "2026-01-31 02:59:54+00:00",
+  "min_time": "2023-02-01 00:00:05+00:00",
   "snap_test": "2026-01-01 02:59:54+00:00",
-  "train_rows": 242162,
+  "train_rows": 1946215,
   "test_rows": 73007,
-  "train_churn_rate": 0.3850975793064147,
+  "train_churn_rate": 0.42274363315461033,
   "test_churn_rate": 0.5266344323147095,
   "n_features": 49,
+  "n_train_snapshots": 55,
+  "pooling_config": {
+    "rolling_step_days": 30,
+    "max_pool_snapshots": 0,
+    "lookback_days": 90,
+    "churn_window_days": 30
+  },
   "using_partitioned_dataset": true
 }

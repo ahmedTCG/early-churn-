@@ -13,6 +13,7 @@ warnings.filterwarnings("ignore", message=".*encountered in matmul.*")
 np.seterr(over="ignore", divide="ignore", invalid="ignore")
 
 ID_COL = "external_customerkey"
+LOOKBACK_DAYS = 90
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CLEANED_FILE = PROJECT_ROOT / "cleaned_events.parquet"
@@ -37,13 +38,13 @@ def get_max_time() -> pd.Timestamp:
     return s.max()
 
 
-def load_all_activity_events() -> pd.DataFrame:
-    """Load ALL activity events (full history, not just lookback window)."""
+def load_events(window_start: pd.Timestamp, window_end: pd.Timestamp) -> pd.DataFrame:
     cols = [ID_COL, "event_time", "interaction_type"]
     df = pd.read_parquet(ACTIVITY_FILE, columns=cols)
 
     df["event_time"] = pd.to_datetime(df["event_time"], errors="coerce", utc=True)
     df = df.dropna(subset=[ID_COL, "event_time", "interaction_type"]).copy()
+    df = df[(df["event_time"] > window_start) & (df["event_time"] <= window_end)].copy()
 
     df[ID_COL] = df[ID_COL].astype("string").str.strip().astype("category")
     df["interaction_type"] = df["interaction_type"].astype("string").str.strip().str.lower().astype("category")
@@ -52,8 +53,8 @@ def load_all_activity_events() -> pd.DataFrame:
 
 def get_weak_signal_customers(activity_customers: set, snapshot_time: pd.Timestamp) -> pd.DataFrame:
     """
-    Find customers who exist in cleaned_events but have NEVER had any activity events.
-    These are customers with only bounce/cancel/unsub events in their entire history.
+    Find customers who exist in cleaned_events but have NO activity events.
+    These are customers with only bounce/cancel/unsub events.
     """
     if not CLEANED_FILE.exists():
         return pd.DataFrame(columns=[ID_COL])
@@ -63,7 +64,7 @@ def get_weak_signal_customers(activity_customers: set, snapshot_time: pd.Timesta
     cleaned[ID_COL] = cleaned[ID_COL].astype("string").str.strip()
     all_customers = set(cleaned[ID_COL].unique())
     
-    # Find customers who NEVER had activity events
+    # Find customers NOT in activity events
     weak_signal_ids = all_customers - activity_customers
     
     if not weak_signal_ids:
@@ -75,7 +76,7 @@ def get_weak_signal_customers(activity_customers: set, snapshot_time: pd.Timesta
         "snapshot_time": snapshot_time,
         "churn_probability": 1.0,
         "churn_bucket": "weak_signal",
-        "churn_action": 1,
+        "churn_action": 1,  # Flag for action (they need attention)
     })
     
     return weak_df
@@ -110,52 +111,33 @@ def main():
     feature_list = json.loads(FEATURES_FILE.read_text(encoding="utf-8"))
 
     snapshot_time = get_max_time()
+    window_start = snapshot_time - pd.Timedelta(days=LOOKBACK_DAYS)
 
-    # Load ALL activity events (full history)
-    print("Loading all activity events (full history)...")
-    events = load_all_activity_events()
-    
-    # Filter to events up to snapshot time
-    events = events[events["event_time"] <= snapshot_time].copy()
-    
-    # All customers who ever had activity events
+    # Load activity events and build features
+    events = load_events(window_start, snapshot_time)
     activity_customers = set(events[ID_COL].unique())
-    print(f"Customers with activity history: {len(activity_customers):,}")
 
-    # Build features using full history
-    print("Building features...")
     feats = build_customer_features(events, snapshot_time=snapshot_time)
-    print(f"Features built for: {len(feats):,} customers")
-    
-    # Show recency distribution
-    recency = feats["recency_days"]
-    print(f"\nRecency distribution:")
-    print(f"  Min: {recency.min()} days")
-    print(f"  Max: {recency.max()} days")
-    print(f"  Median: {recency.median():.0f} days")
-    print(f"  Customers with recency > 90 days: {(recency > 90).sum():,}")
-
     X = make_X(feats, feature_list)
 
     proba = model.predict_proba(X)[:, 1]
 
-    # Score all customers with activity history
+    # Score customers with activity events
     scored = feats[[ID_COL]].copy()
     scored["snapshot_time"] = snapshot_time
     scored["churn_probability"] = proba
 
-    # --- Bucketization (fixed thresholds) ---
-    # Fixed thresholds for consistent, interpretable buckets
-    THRESH_VERY_HIGH = 0.8
-    THRESH_HIGH = 0.6
-    THRESH_MEDIUM = 0.4
+    # --- Bucketization (percentile-based) ---
+    p90 = scored["churn_probability"].quantile(0.90)
+    p70 = scored["churn_probability"].quantile(0.70)
+    p40 = scored["churn_probability"].quantile(0.40)
 
     def bucketize(p: float) -> str:
-        if p >= THRESH_VERY_HIGH:
+        if p >= p90:
             return "very_high"
-        elif p >= THRESH_HIGH:
+        elif p >= p70:
             return "high"
-        elif p >= THRESH_MEDIUM:
+        elif p >= p40:
             return "medium"
         else:
             return "low"
@@ -163,7 +145,7 @@ def main():
     scored["churn_bucket"] = scored["churn_probability"].apply(bucketize)
     scored["churn_action"] = scored["churn_bucket"].isin(["high", "very_high"]).astype(int)
 
-    # --- Add weak signal customers (NEVER had activity events) ---
+    # --- Add weak signal customers ---
     weak_signal_df = get_weak_signal_customers(activity_customers, snapshot_time)
     n_weak_signal = len(weak_signal_df)
 
@@ -178,11 +160,11 @@ def main():
     OUT_BUCKET_THRESHOLDS.write_text(
         json.dumps({
             "snapshot_time": str(snapshot_time),
-            "threshold_very_high": THRESH_VERY_HIGH,
-            "threshold_high": THRESH_HIGH,
-            "threshold_medium": THRESH_MEDIUM,
+            "p40_medium_min": float(p40),
+            "p70_high_min": float(p70),
+            "p90_very_high_min": float(p90),
             "action_rule": "high_or_very_high_or_weak_signal",
-            "weak_signal_note": "Customers who NEVER had activity events (only bounce/cancel/unsub)",
+            "weak_signal_note": "Customers with no activity events (only bounce/cancel/unsub)",
         }, indent=2),
         encoding="utf-8"
     )
@@ -193,7 +175,6 @@ def main():
     out.to_csv(OUT_BUCKETED_CSV, index=False)
 
     # --- Print summary ---
-    print()
     print("=" * 60)
     print("SCORING RESULTS")
     print("=" * 60)
@@ -204,13 +185,6 @@ def main():
     print(f"  Total: {len(scored):,}")
     print()
     
-    # Show how many had recent vs old activity
-    recent_active = (feats["recency_days"] <= 90).sum()
-    dormant = (feats["recency_days"] > 90).sum()
-    print(f"  - Active in last 90 days: {recent_active:,}")
-    print(f"  - Dormant (>90 days): {dormant:,}")
-    print()
-    
     print("Bucket distribution (model-scored):")
     bucket_counts = scored["churn_bucket"].value_counts()
     bucket_pct = scored["churn_bucket"].value_counts(normalize=True)
@@ -219,14 +193,14 @@ def main():
             print(f"  {bucket:10}: {bucket_counts[bucket]:>7,} ({bucket_pct[bucket]:.1%})")
     
     print()
-    print("Bucket thresholds (fixed):")
-    print(f"  very_high >= {THRESH_VERY_HIGH}")
-    print(f"  high      >= {THRESH_HIGH}")
-    print(f"  medium    >= {THRESH_MEDIUM}")
-    print(f"  low       <  {THRESH_MEDIUM}")
+    print("Bucket thresholds:")
+    print(f"  very_high >= {p90:.3f}")
+    print(f"  high      >= {p70:.3f}")
+    print(f"  medium    >= {p40:.3f}")
+    print(f"  low       <  {p40:.3f}")
     
     print()
-    print("Weak signal customers (NEVER had activity events):")
+    print("Weak signal customers (no activity events):")
     print(f"  Total: {n_weak_signal:,}")
     print(f"  These customers have only bounce/cancel/unsub events")
     print(f"  Assigned: churn_probability=1.0, churn_bucket='weak_signal'")
@@ -239,11 +213,7 @@ def main():
     
     print()
     print("Overall bucket distribution:")
-    overall = out["churn_bucket"].value_counts()
-    for bucket in ["very_high", "high", "medium", "low", "weak_signal"]:
-        if bucket in overall.index:
-            pct = overall[bucket] / len(out) * 100
-            print(f"  {bucket:12}: {overall[bucket]:>7,} ({pct:.1f}%)")
+    print(out["churn_bucket"].value_counts().sort_index())
     
     print()
     print(f"Saved parquet: {OUT_PARQUET}")

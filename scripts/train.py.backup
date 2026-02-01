@@ -27,7 +27,7 @@ warnings.filterwarnings("ignore", message=".*encountered in matmul.*")
 np.seterr(over="ignore", divide="ignore", invalid="ignore")
 
 # -------------------------
-# Config
+# Config (keep minimal)
 # -------------------------
 ID_COL = "external_customerkey"
 TARGET = "churn_30d"
@@ -35,12 +35,9 @@ TARGET = "churn_30d"
 CHURN_WINDOW_DAYS = 30
 LOOKBACK_DAYS = 90
 
-# -------------------------
-# Pooled rolling training config
-# -------------------------
 ROLLING_STEP_DAYS = 30
-MAX_POOL_SNAPSHOTS = 0  # 0 = use ALL available snapshots back to data start
-N_EVAL_SNAPSHOTS = 4
+N_POOL_SNAPSHOTS = 4       # training snapshots: T-30, T-60, ...
+N_EVAL_SNAPSHOTS = 4       # eval snapshots: T, T-30, ...
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ACTIVITY_FILE = PROJECT_ROOT / "activity_events.parquet"
@@ -54,9 +51,6 @@ ROLLING_EVAL_FILE = ART_DIR / "rolling_eval.csv"
 IMPORTANCE_FILE = ART_DIR / "feature_importance.csv"
 
 
-# -------------------------
-# Data loading
-# -------------------------
 def _months_in_range(start: pd.Timestamp, end: pd.Timestamp) -> list:
     start_m = pd.Period(start.to_pydatetime(), freq="M")
     end_m = pd.Period(end.to_pydatetime(), freq="M")
@@ -71,7 +65,7 @@ def load_events(window_start: pd.Timestamp, window_end: pd.Timestamp) -> pd.Data
         dataset = ds.dataset(
             str(ACTIVITY_DS_DIR),
             format="parquet",
-            partitioning=ds.partitioning(field_names=["event_month"]),
+            partitioning=ds.partitioning(field_names=["event_month"]),  # directory partition
         )
         table = dataset.to_table(columns=cols, filter=ds.field("event_month").isin(months))
         df = table.to_pandas()
@@ -105,26 +99,10 @@ def get_max_time() -> pd.Timestamp:
     raise FileNotFoundError("No activity data found. Run steps 1→3.")
 
 
-def get_min_time() -> pd.Timestamp:
-    if ACTIVITY_FILE.exists():
-        s = pd.to_datetime(pd.read_parquet(ACTIVITY_FILE, columns=["event_time"])["event_time"], errors="coerce", utc=True)
-        return s.min()
-    if ACTIVITY_DS_DIR.exists():
-        dataset = ds.dataset(str(ACTIVITY_DS_DIR), format="parquet")
-        table = dataset.to_table(columns=["event_time"])
-        s = pd.to_datetime(table.column("event_time").to_pandas(), errors="coerce", utc=True)
-        return s.min()
-    raise FileNotFoundError("No activity data found. Run steps 1→3.")
-
-
-# -------------------------
-# Dataset building
-# -------------------------
 def make_dataset(snapshot_time: pd.Timestamp) -> pd.DataFrame:
     """
-    Build features and labels for a single snapshot.
-    Features: events in (T-90d, T]
-    Label: no activity in (T, T+30d]
+    Features: (T-90d, T]
+    Label   : no activity in (T, T+30d]
     """
     window_start = snapshot_time - pd.Timedelta(days=LOOKBACK_DAYS)
     window_end = snapshot_time + pd.Timedelta(days=CHURN_WINDOW_DAYS)
@@ -160,76 +138,19 @@ def make_X(ds_: pd.DataFrame) -> pd.DataFrame:
         if c.startswith(("n_events_last_", "active_days_last_", "cnt_", "n_session_events_", "n_email_engagement_", "n_orders_")):
             X[c] = np.log1p(X[c])
 
+    # drop constant features
     X = X.loc[:, X.std(axis=0) != 0]
     return X
 
 
-# -------------------------
-# Pooled training dataset
-# -------------------------
-def build_pooled_train_dataset(test_snapshot: pd.Timestamp) -> pd.DataFrame:
-    """
-    Build training dataset by pooling multiple rolling snapshots.
-    Uses all available snapshots from test_snapshot back to earliest possible.
-    
-    Args:
-        test_snapshot: The test snapshot time (training uses earlier snapshots)
-    
-    Returns:
-        Concatenated DataFrame with all training snapshots
-    """
-    min_time = get_min_time()
-    # Earliest snapshot needs LOOKBACK_DAYS of history + CHURN_WINDOW_DAYS for labels
-    earliest_allowed = min_time + pd.Timedelta(days=LOOKBACK_DAYS)
-    
+def pooled_train_dataset(test_snapshot: pd.Timestamp) -> pd.DataFrame:
     parts = []
-    snapshot_info = []
-    k = 1
-    
-    while True:
+    for k in range(1, N_POOL_SNAPSHOTS + 1):
         snap = test_snapshot - pd.Timedelta(days=k * ROLLING_STEP_DAYS)
-        
-        # Stop if we don't have enough history for this snapshot
-        if snap < earliest_allowed:
-            break
-        
-        # Stop if we've reached the max (when MAX_POOL_SNAPSHOTS > 0)
-        if MAX_POOL_SNAPSHOTS > 0 and len(parts) >= MAX_POOL_SNAPSHOTS:
-            break
-        
-        ds_ = make_dataset(snap)
-        ds_["_snapshot_time"] = snap  # Track which snapshot each row came from
-        parts.append(ds_)
-        
-        churn_rate = ds_[TARGET].mean()
-        snapshot_info.append({
-            "snapshot": snap,
-            "rows": len(ds_),
-            "churn_rate": churn_rate
-        })
-        
-        k += 1
-    
-    if not parts:
-        raise ValueError("No snapshots available for pooled training. Check data range.")
-    
-    # Print snapshot summary
-    print(f"\nPooled training: {len(parts)} snapshots")
-    print("-" * 50)
-    for info in snapshot_info:
-        print(f"  {info['snapshot'].date()}: {info['rows']:,} rows, churn={info['churn_rate']:.1%}")
-    print("-" * 50)
-    
-    pooled = pd.concat(parts, ignore_index=True)
-    print(f"Total pooled rows: {len(pooled):,}")
-    print(f"Overall churn rate: {pooled[TARGET].mean():.1%}")
-    
-    return pooled
+        parts.append(make_dataset(snap))
+    return pd.concat(parts, ignore_index=True)
 
 
-# -------------------------
-# Feature importance
-# -------------------------
 def feature_importance(model: CalibratedClassifierCV, feature_names: list) -> pd.DataFrame:
     coefs = []
     for cc in model.calibrated_classifiers_:
@@ -242,9 +163,6 @@ def feature_importance(model: CalibratedClassifierCV, feature_names: list) -> pd
     return df.sort_values("abs_coef", ascending=False).reset_index(drop=True)
 
 
-# -------------------------
-# Evaluation
-# -------------------------
 def eval_snapshot(model, feature_list: list, snapshot_time: pd.Timestamp) -> dict:
     ds_ = make_dataset(snapshot_time)
     y = ds_[TARGET].astype(int)
@@ -259,7 +177,8 @@ def eval_snapshot(model, feature_list: list, snapshot_time: pd.Timestamp) -> dic
     thr = 0.5
     y_hat = (proba >= thr).astype(int)
 
-    # Optimize threshold for F1
+    # --- Optimize threshold to maximize F1 on this snapshot ---
+    # Note: this is per-snapshot, useful for analysis and selecting a global threshold later.
     best = {"thr": 0.5, "f1": -1.0, "precision": 0.0, "recall": 0.0, "accuracy": 0.0}
     for t in np.linspace(0.01, 0.99, 99):
         yh = (proba >= t).astype(int)
@@ -271,6 +190,11 @@ def eval_snapshot(model, feature_list: list, snapshot_time: pd.Timestamp) -> dic
             best["recall"] = float(recall_score(y, yh, zero_division=0))
             best["accuracy"] = float(accuracy_score(y, yh))
 
+    thr_opt = best["thr"]
+    accuracy_opt = best["accuracy"]
+    precision_opt = best["precision"]
+    recall_opt = best["recall"]
+    f1_opt = best["f1"]
     return {
         "snapshot_time": str(snapshot_time),
         "rows": int(len(ds_)),
@@ -280,41 +204,24 @@ def eval_snapshot(model, feature_list: list, snapshot_time: pd.Timestamp) -> dic
         "precision": float(precision_score(y, y_hat, zero_division=0)),
         "recall": float(recall_score(y, y_hat, zero_division=0)),
         "f1": float(f1_score(y, y_hat, zero_division=0)),
-        "threshold_opt": float(best["thr"]),
-        "accuracy_opt": float(best["accuracy"]),
-        "precision_opt": float(best["precision"]),
-        "recall_opt": float(best["recall"]),
-        "f1_opt": float(best["f1"]),
+        "threshold_opt": float(thr_opt),
+        "accuracy_opt": float(accuracy_opt),
+        "precision_opt": float(precision_opt),
+        "recall_opt": float(recall_opt),
+        "f1_opt": float(f1_opt),
         "roc_auc": float(roc_auc_score(y, proba)),
         "pr_auc": float(average_precision_score(y, proba)),
     }
 
 
-# -------------------------
-# Main
-# -------------------------
 def main():
     ART_DIR.mkdir(exist_ok=True)
 
     max_time = get_max_time()
-    min_time = get_min_time()
     snap_test = max_time - pd.Timedelta(days=CHURN_WINDOW_DAYS)
 
-    print("=" * 60)
-    print("CHURN MODEL TRAINING")
-    print("=" * 60)
-    print(f"Data range: {min_time} → {max_time}")
-    print(f"Test snapshot: {snap_test}")
-    print(f"Config: LOOKBACK={LOOKBACK_DAYS}d, CHURN_WINDOW={CHURN_WINDOW_DAYS}d")
-    print(f"Pooling: step={ROLLING_STEP_DAYS}d, max_snapshots={'ALL' if MAX_POOL_SNAPSHOTS == 0 else MAX_POOL_SNAPSHOTS}")
-
-    # Build datasets
-    train_ds = build_pooled_train_dataset(snap_test)
+    train_ds = pooled_train_dataset(snap_test)
     test_ds = make_dataset(snap_test)
-
-    # Remove snapshot tracking column before training
-    if "_snapshot_time" in train_ds.columns:
-        train_ds = train_ds.drop(columns=["_snapshot_time"])
 
     y_train = train_ds[TARGET].astype(int)
     y_test = test_ds[TARGET].astype(int)
@@ -322,19 +229,11 @@ def main():
     X_train = make_X(train_ds)
     X_test = make_X(test_ds)
 
-    # Align features
     for c in X_train.columns:
         if c not in X_test.columns:
             X_test[c] = 0
     X_test = X_test[X_train.columns]
 
-    print(f"\nTraining set: {len(X_train):,} rows, {X_train.shape[1]} features")
-    print(f"Test set: {len(X_test):,} rows")
-    print(f"Train churn rate: {y_train.mean():.1%}")
-    print(f"Test churn rate: {y_test.mean():.1%}")
-
-    # Train model
-    print("\nTraining model...")
     base = Pipeline([
         ("scaler", StandardScaler()),
         ("clf", SGDClassifier(
@@ -352,12 +251,11 @@ def main():
     model = CalibratedClassifierCV(base, method="sigmoid", cv=3)
     model.fit(X_train, y_train)
 
-    # Save artifacts
+    # Save model + features
     joblib.dump(model, MODEL_FILE)
     FEATURES_FILE.write_text(json.dumps(list(X_train.columns), indent=2), encoding="utf-8")
 
-    # Rolling evaluation
-    print("\nRunning rolling evaluation...")
+    # Rolling eval
     eval_snaps = []
     for k in range(N_EVAL_SNAPSHOTS):
         s = snap_test - pd.Timedelta(days=k * ROLLING_STEP_DAYS)
@@ -372,39 +270,28 @@ def main():
     imp = feature_importance(model, list(X_train.columns))
     imp.to_csv(IMPORTANCE_FILE, index=False)
 
-    # Metadata
+    # Meta
     meta = {
         "max_time": str(max_time),
-        "min_time": str(min_time),
         "snap_test": str(snap_test),
         "train_rows": int(len(train_ds)),
         "test_rows": int(len(test_ds)),
         "train_churn_rate": float(y_train.mean()),
         "test_churn_rate": float(y_test.mean()),
         "n_features": int(X_train.shape[1]),
-        "n_train_snapshots": int(len([p for p in train_ds.columns if p != "_snapshot_time"]) if "_snapshot_time" not in train_ds.columns else 0),
-        "pooling_config": {
-            "rolling_step_days": ROLLING_STEP_DAYS,
-            "max_pool_snapshots": MAX_POOL_SNAPSHOTS,
-            "lookback_days": LOOKBACK_DAYS,
-            "churn_window_days": CHURN_WINDOW_DAYS,
-        },
         "using_partitioned_dataset": bool(ACTIVITY_DS_DIR.exists()),
     }
     META_FILE.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    # Final output
-    print("\n" + "=" * 60)
-    print("RESULTS")
-    print("=" * 60)
-    print(f"Saved model: {MODEL_FILE}")
-    print(f"Saved features: {FEATURES_FILE}")
-    print(f"Saved meta: {META_FILE}")
-    print(f"Saved eval: {ROLLING_EVAL_FILE}")
-    print(f"Saved importance: {IMPORTANCE_FILE}")
-    print("\nRolling evaluation:")
+    # One clean output
+    print("Saved model :", MODEL_FILE)
+    print("Saved feats :", FEATURES_FILE)
+    print("Saved meta  :", META_FILE)
+    print("Saved eval  :", ROLLING_EVAL_FILE)
+    print("Saved imp   :", IMPORTANCE_FILE)
+    print("\nRolling eval:")
     with pd.option_context("display.max_columns", None, "display.width", 200):
-        print(rolling[["snapshot_time", "rows", "churn_rate", "roc_auc", "pr_auc", "f1_opt"]].to_string(index=False))
+        print(rolling)
 
 
 if __name__ == "__main__":
