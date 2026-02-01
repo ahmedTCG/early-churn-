@@ -40,7 +40,7 @@ LOOKBACK_DAYS = 90
 # -------------------------
 ROLLING_STEP_DAYS = 30
 MAX_POOL_SNAPSHOTS = 0  # 0 = use ALL available snapshots back to data start
-N_EVAL_SNAPSHOTS = 4
+N_EVAL_SNAPSHOTS = 12  # Evaluate on 12 months (full year)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ACTIVITY_FILE = PROJECT_ROOT / "activity_events.parquet"
