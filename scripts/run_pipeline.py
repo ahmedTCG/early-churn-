@@ -9,7 +9,7 @@ PIPELINE_STEPS = [
     "clean.py",
     "activity.py",
     "partition_activity.py",
-    "train.py",
+    "train_lgbm.py",
     "score.py",
 ]
 
@@ -30,7 +30,7 @@ def run_step(script_name: str):
 
 
 def main():
-    print("Starting churn model pipeline")
+    print("Starting churn model pipeline (LightGBM)")
     print("Project root:", PROJECT_ROOT)
     for step in PIPELINE_STEPS:
         run_step(step)

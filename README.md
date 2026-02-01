@@ -1,14 +1,14 @@
 # Customer Churn Prediction Pipeline
 
-ML pipeline for predicting customer churn based on engagement events.
+ML pipeline for predicting customer churn using LightGBM.
 
 ## Model Performance
 
 | Metric | Value |
 |--------|-------|
-| ROC-AUC | 0.891 |
-| PR-AUC | 0.870 |
-| F1 | 0.848 |
+| ROC-AUC | 0.905 |
+| PR-AUC | 0.888 |
+| F1 | 0.855 |
 
 ## Quick Start
 ```bash
@@ -24,7 +24,7 @@ python scripts/run_pipeline.py
 
 ## Pipeline
 ```
-3_years_churn.csv → clean.py → activity.py → partition_activity.py → train.py → score.py → customer_scores.parquet
+3_years_churn.csv → clean.py → activity.py → partition_activity.py → train_lgbm.py → score.py → customer_scores.parquet
 ```
 
 ## Data Source
@@ -43,7 +43,10 @@ WHERE event_time >= DATEADD(month, -36, CURRENT_DATE)
 ├── src/churn/
 │   ├── config.py                # All settings
 │   └── features.py              # Feature engineering
-├── scripts/                     # Pipeline steps
+├── scripts/
+│   ├── train_lgbm.py            # LightGBM training (active)
+│   ├── train.py                 # SGD training (backup)
+│   └── score.py                 # Score customers
 ├── artifacts/                   # Model & metadata
 └── customer_scores.parquet      # Output
 ```
@@ -61,7 +64,7 @@ THRESH_MEDIUM = 0.4
 
 ## Output
 
-`customer_scores.parquet`:
+`customer_scores.parquet` (200,000 customers):
 
 | Column | Description |
 |--------|-------------|
@@ -72,10 +75,20 @@ THRESH_MEDIUM = 0.4
 
 ## Risk Buckets
 
-| Bucket | Probability | Action |
-|--------|-------------|--------|
-| very_high | >= 0.8 | Priority retention |
-| high | >= 0.6 | Retention campaigns |
-| medium | >= 0.4 | Monitor |
-| low | < 0.4 | Healthy |
-| weak_signal | N/A | No engagement data |
+| Bucket | Probability | Count | Action |
+|--------|-------------|-------|--------|
+| very_high | >= 0.8 | 149,920 (75%) | Priority retention |
+| high | >= 0.6 | 14,057 (7%) | Retention campaigns |
+| medium | >= 0.4 | 7,721 (4%) | Monitor |
+| low | < 0.4 | 16,225 (8%) | Healthy |
+| weak_signal | N/A | 12,077 (6%) | No engagement data |
+
+## Top Features
+
+| Rank | Feature | Importance |
+|------|---------|------------|
+| 1 | recency_days | 682 |
+| 2 | active_days_last_90d | 494 |
+| 3 | cnt_emarsys_open_last_90d | 327 |
+| 4 | freq_trend_60_90 | 324 |
+| 5 | active_days_last_30d | 194 |
