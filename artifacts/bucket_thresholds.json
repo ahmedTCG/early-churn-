@@ -1,0 +1,7 @@
+{
+  "snapshot_time": "2026-01-31 02:59:54+00:00",
+  "p40_medium_min": 0.4255431478684373,
+  "p70_high_min": 0.748748747072875,
+  "p90_very_high_min": 0.8587211394264331,
+  "action_rule": "high_or_very_high"
+}

@@ -11,7 +11,14 @@ from sklearn.pipeline import Pipeline
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import SGDClassifier
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+)
 
 from churn.features import build_customer_features
 
@@ -167,10 +174,41 @@ def eval_snapshot(model, feature_list: list, snapshot_time: pd.Timestamp) -> dic
     X = X[feature_list]
 
     proba = model.predict_proba(X)[:, 1]
+    thr = 0.5
+    y_hat = (proba >= thr).astype(int)
+
+    # --- Optimize threshold to maximize F1 on this snapshot ---
+    # Note: this is per-snapshot, useful for analysis and selecting a global threshold later.
+    best = {"thr": 0.5, "f1": -1.0, "precision": 0.0, "recall": 0.0, "accuracy": 0.0}
+    for t in np.linspace(0.01, 0.99, 99):
+        yh = (proba >= t).astype(int)
+        f1v = f1_score(y, yh, zero_division=0)
+        if f1v > best["f1"]:
+            best["thr"] = float(t)
+            best["f1"] = float(f1v)
+            best["precision"] = float(precision_score(y, yh, zero_division=0))
+            best["recall"] = float(recall_score(y, yh, zero_division=0))
+            best["accuracy"] = float(accuracy_score(y, yh))
+
+    thr_opt = best["thr"]
+    accuracy_opt = best["accuracy"]
+    precision_opt = best["precision"]
+    recall_opt = best["recall"]
+    f1_opt = best["f1"]
     return {
         "snapshot_time": str(snapshot_time),
         "rows": int(len(ds_)),
         "churn_rate": float(y.mean()),
+        "threshold": float(thr),
+        "accuracy": float(accuracy_score(y, y_hat)),
+        "precision": float(precision_score(y, y_hat, zero_division=0)),
+        "recall": float(recall_score(y, y_hat, zero_division=0)),
+        "f1": float(f1_score(y, y_hat, zero_division=0)),
+        "threshold_opt": float(thr_opt),
+        "accuracy_opt": float(accuracy_opt),
+        "precision_opt": float(precision_opt),
+        "recall_opt": float(recall_opt),
+        "f1_opt": float(f1_opt),
         "roc_auc": float(roc_auc_score(y, proba)),
         "pr_auc": float(average_precision_score(y, proba)),
     }
@@ -252,7 +290,8 @@ def main():
     print("Saved eval  :", ROLLING_EVAL_FILE)
     print("Saved imp   :", IMPORTANCE_FILE)
     print("\nRolling eval:")
-    print(rolling)
+    with pd.option_context("display.max_columns", None, "display.width", 200):
+        print(rolling)
 
 
 if __name__ == "__main__":

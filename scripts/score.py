@@ -24,6 +24,8 @@ FEATURES_FILE = ART_DIR / "feature_list.json"
 
 OUT_PARQUET = PROJECT_ROOT / "customer_scores.parquet"
 OUT_CSV = PROJECT_ROOT / "customer_scores.csv"
+OUT_BUCKETED_CSV = PROJECT_ROOT / "customer_scores_bucketed.csv"
+OUT_BUCKET_THRESHOLDS = ART_DIR / "bucket_thresholds.json"
 
 
 def get_max_time() -> pd.Timestamp:
@@ -90,12 +92,61 @@ def main():
     out["snapshot_time"] = snapshot_time
     out["churn_probability"] = proba
 
+    # --- Bucketization (percentile-based) ---
+    # Buckets are relative to this scoring run's population:
+    # very_high = top 10%, high = next 20%, medium = next 30%, low = bottom 40%
+    p90 = out["churn_probability"].quantile(0.90)
+    p70 = out["churn_probability"].quantile(0.70)
+    p40 = out["churn_probability"].quantile(0.40)
+
+    def bucketize(p: float) -> str:
+        if p >= p90:
+            return "very_high"
+        elif p >= p70:
+            return "high"
+        elif p >= p40:
+            return "medium"
+        else:
+            return "low"
+
+    out["churn_bucket"] = out["churn_probability"].apply(bucketize)
+
+    # --- Align decision threshold to buckets ---
+    # Recommended default: act on top 30% risk (high + very_high)
+    out["churn_action"] = out["churn_bucket"].isin(["high", "very_high"]).astype(int)
+
+    # Persist the thresholds used for this scoring run (reproducible + auditable)
+    ART_DIR.mkdir(exist_ok=True)
+    OUT_BUCKET_THRESHOLDS.write_text(
+        json.dumps({
+            "snapshot_time": str(snapshot_time),
+            "p40_medium_min": float(p40),
+            "p70_high_min": float(p70),
+            "p90_very_high_min": float(p90),
+            "action_rule": "high_or_very_high",
+        }, indent=2),
+        encoding="utf-8"
+    )
+
     out.to_parquet(OUT_PARQUET, index=False)
     out.to_csv(OUT_CSV, index=False)
+    out.to_csv(OUT_BUCKETED_CSV, index=False)
+
+    print("Bucket distribution:")
+    print(out["churn_bucket"].value_counts(normalize=True).round(3))
+    print("Bucket thresholds:")
+    print(f"very_high >= {p90:.3f}")
+    print(f"high      >= {p70:.3f}")
+    print(f"medium    >= {p40:.3f}")
 
     print("Snapshot time:", snapshot_time)
     print("Rows scored  :", len(out))
-    print("Saved        :", OUT_PARQUET, "and", OUT_CSV)
+    print("Saved parquet:", OUT_PARQUET)
+    print("Saved csv    :", OUT_CSV)
+    if "churn_bucket" in out.columns:
+        print("Saved bucket :", OUT_BUCKETED_CSV)
+    if "OUT_BUCKET_THRESHOLDS" in globals():
+        print("Saved bucket thresholds:", OUT_BUCKET_THRESHOLDS)
 
 
 if __name__ == "__main__":
